@@ -1,0 +1,86 @@
+
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+)
+from peft import LoraConfig
+from trl import SFTConfig, SFTTrainer
+
+MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+if not torch.cuda.is_available():
+    raise RuntimeError("A GPU is required for this training script.")
+
+dataset = load_dataset(
+    "json",
+    data_files="dataset.jsonl",
+    split="train",
+)
+
+dtype = (
+    torch.bfloat16
+    if torch.cuda.is_bf16_supported()
+    else torch.float16
+)
+
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=dtype,
+    bnb_4bit_use_double_quant=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    quantization_config=quant_config,
+    device_map="auto",
+)
+model.config.use_cache = False
+
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj"
+    ],
+)
+
+args = SFTConfig(
+    output_dir="./llama8b-adapter",
+    num_train_epochs=1,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    learning_rate=2e-4,
+    logging_steps=1,
+    save_strategy="epoch",
+    max_length=512,
+    gradient_checkpointing=True,
+    report_to="none",
+    fp16=(dtype == torch.float16),
+    bf16=(dtype == torch.bfloat16),
+    dataset_text_field="text",
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=args,
+    train_dataset=dataset,
+    peft_config=lora_config,
+    processing_class=tokenizer,
+)
+
+trainer.train()
+trainer.save_model("./llama8b-adapter")
+tokenizer.save_pretrained("./llama8b-adapter")
+
+print("SUCCESS: Fine-tuning completed.")
